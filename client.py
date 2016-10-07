@@ -7,6 +7,7 @@ from signal import SIGTERM, SIGINT
 
 from aiohttp import ClientSession
 from asyncio_redis import Pool as RedisPool, Connection as RedisConn
+from feedparser import parse as parse_feed
 
 
 REDIS_CONF = {
@@ -17,10 +18,57 @@ REDIS_CONF = {
 LOGGER = 'playground'
 
 
+class FeedError(ValueError):
+    "Raise when cannot parse RSS/Atom feed"
+
+
+class Feed(object):
+    def __init__(self, **kwargs):
+        self.href = kwargs.pop('link', '')  # or 'href'
+        self.updated = kwargs.pop('updated_parsed', None)  # or 'published_parsed'
+        self.title = kwargs.pop('title', '')
+        self.entries = kwargs.pop('entries', [])
+
+    def __str__(self):
+        return self.title
+
+
+class Entry(object):
+    def __init__(self, **kwargs):
+        self.link = kwargs.pop('link', '')
+        self.summary = kwargs.pop('summary', '')
+        self.published = kwargs.pop('published', None)
+
+        self.author = kwargs.pop('author', '')
+        self.media_content = kwargs.pop('media_content', {})
+        # Out: dict_keys(['media_statistics', 'summary', 'media_content', 'href', 'author_detail', 'authors',
+        # 'guidislink', 'title', 'link', 'media_starrating', 'yt_videoid', 'media_community', 'id', 'title_detail',
+        # 'updated_parsed', 'updated', 'media_thumbnail', 'author', 'summary_detail', 'published', 'yt_channelid', 'links',
+        # 'published_parsed'])
+
+    def __str__(self):
+        return '<Entry {}>'.format(self.link)
+
+
 class FeedUpdater(object):
 
     def __init__(self, loop):
+        self._loop = loop
         self._redis = None
+
+    def parse(self, feed):
+        feed = parse_feed(feed)
+        if feed.bozo:
+            raise FeedError
+
+        parsed = Feed(**feed.feed)
+        # TODO Check if existing parsed.published is newer than in our storage
+        # If so skip parsing entries, else parse entries newer than that date
+        parsed.entries = list(map(lambda data: Entry(**data), feed.entries))
+        if not parsed.href:
+            pass
+
+        return feed
 
     async def _fetch(self, session: ClientSession):
         logger = logging.getLogger(LOGGER)
@@ -28,7 +76,11 @@ class FeedUpdater(object):
             url = (await self._redis.blpop(['urls', ])).value
             async with session.get(url) as response:
                 response = await response.read()
-                logger.info('Fetched: %s', url)
+            try:
+                feed = await self._loop.run_in_executor(None, self.parse, response)
+                logger.info('Parsed feed: %s', url)
+            except FeedError:
+                logger.warn('Invalid feed: %s', url)
 
     async def run(self):
         logger = logging.getLogger(LOGGER)

@@ -2,3 +2,4 @@ aiodns==1.1.1
 cchardet==1.0.0
 aiohttp==0.21.6
 asyncio-redis==0.14.3
+feedparser==5.2.1
