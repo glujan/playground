@@ -1,0 +1,24 @@
+syntax = "proto3";
+
+import "google/protobuf/timestamp.proto";
+
+package playground.models;
+
+
+message Entry {
+    string link = 1;
+    string summary = 2;
+    google.protobuf.Timestamp published = 3;
+    string author = 4;
+
+    string media_content = 16;
+}
+
+
+message Feed {
+    string link = 1;
+    string title = 2;
+    google.protobuf.Timestamp updated= 3;
+    repeated Entry entries = 16;
+}
+

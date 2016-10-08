@@ -4,3 +4,4 @@ Currently it's using:
 
  * `asyncio` with `aiohttp` library
  * Redis (via `asyncio`)
+ * Google Protocol Buffers

@@ -8,6 +8,9 @@ from signal import SIGTERM, SIGINT
 from aiohttp import ClientSession
 from asyncio_redis import Pool as RedisPool, Connection as RedisConn
 from feedparser import parse as parse_feed
+from google.protobuf.message import Message
+
+from utils import create_entry, create_feed
 
 
 REDIS_CONF = {
@@ -22,55 +25,25 @@ class FeedError(ValueError):
     "Raise when cannot parse RSS/Atom feed"
 
 
-class Feed(object):
-    def __init__(self, **kwargs):
-        self.href = kwargs.pop('link', '')  # or 'href'
-        self.updated = kwargs.pop('updated_parsed', None)  # or 'published_parsed'
-        self.title = kwargs.pop('title', '')
-        self.entries = kwargs.pop('entries', [])
-
-    def __str__(self):
-        return self.title
-
-
-class Entry(object):
-    def __init__(self, **kwargs):
-        self.link = kwargs.pop('link', '')
-        self.summary = kwargs.pop('summary', '')
-        self.published = kwargs.pop('published', None)
-
-        self.author = kwargs.pop('author', '')
-        self.media_content = kwargs.pop('media_content', {})
-        # Out: dict_keys(['media_statistics', 'summary', 'media_content', 'href', 'author_detail', 'authors',
-        # 'guidislink', 'title', 'link', 'media_starrating', 'yt_videoid', 'media_community', 'id', 'title_detail',
-        # 'updated_parsed', 'updated', 'media_thumbnail', 'author', 'summary_detail', 'published', 'yt_channelid', 'links',
-        # 'published_parsed'])
-
-    def __str__(self):
-        return '<Entry {}>'.format(self.link)
-
-
 class FeedUpdater(object):
 
-    def __init__(self, loop):
+    def __init__(self, loop: aio.AbstractEventLoop) -> None:
         self._loop = loop
-        self._redis = None
+        self._redis = None  # type: RedisPool
 
-    def parse(self, feed):
-        feed = parse_feed(feed)
-        if feed.bozo:
+    def parse(self, xml: str) -> Message:
+        parsed = parse_feed(xml)
+        if parsed.bozo:
             raise FeedError
 
-        parsed = Feed(**feed.feed)
-        # TODO Check if existing parsed.published is newer than in our storage
-        # If so skip parsing entries, else parse entries newer than that date
-        parsed.entries = list(map(lambda data: Entry(**data), feed.entries))
-        if not parsed.href:
-            pass
+        feed = create_feed(parsed.feed)
+        entries = list(map(create_entry, parsed.entries))
+        # TODO Filter out entries older than last visit time
+        feed.entries.extend(entries)
 
         return feed
 
-    async def _fetch(self, session: ClientSession):
+    async def _fetch(self, session):
         logger = logging.getLogger(LOGGER)
         while True:
             url = (await self._redis.blpop(['urls', ])).value
@@ -116,7 +89,7 @@ def _setup_argparse():
     return parser.parse_args()
 
 
-def _setup_logging(loglevel):
+def _setup_logging(loglevel: int):
     LEVELS = {
         0: logging.WARNING,
         1: logging.INFO,
