@@ -36,6 +36,23 @@ class FeedUpdater(object):
         self._loop = loop
         self._redis = None  # type: RedisPool
 
+    async def __aenter__(self):
+        if self._redis is None:
+            self._redis = await RedisPool.create(**REDIS_CONF)
+        return self
+
+    async def __aexit__(self, exc_type, exc_value, traceback):
+        if exc_type is not None:
+            self._redis.close()
+        else:
+            await self._redis.close()
+
+    def __aiter__(self):
+        return self
+
+    async def __anext__(self):
+        return (await self._redis.blpop([R_URLS, ])).value.decode('utf8')
+
     def parse(self, xml: str) -> Message:
         parsed = parse_feed(xml)
         if parsed.bozo:
@@ -63,19 +80,14 @@ class FeedUpdater(object):
             logger.info('Parsed feed: %s', url)
             await self._redis.lpush(R_FEED, [feed.SerializePartialToString(), ])
 
-    async def run(self):
-        logger = logging.getLogger(LOGGER)
-        self._redis = await RedisPool.create(**REDIS_CONF)
-        session = ClientSession()
-        logger.info('Starting up FeedUpdater')
-        try:
-            while True:
-                url = (await self._redis.blpop([R_URLS, ])).value.decode('utf8')
-                self._loop.create_task(self.execute(url, session))
-        finally:
-            self._redis.close()
-            session.close()
 
+async def run(loop: aio.AbstractEventLoop) -> None:
+    logger = logging.getLogger(LOGGER)
+    logger.info('Starting up FeedUpdater')
+    async with ClientSession() as session, FeedUpdater(loop) as updater:
+        async for url in updater:
+            logger.debug("Processing url '%s'", url)
+            loop.create_task(updater.execute(url, session))
 
 async def _populate_queue():
     url = "http://localhost:8080/{}"
@@ -142,8 +154,7 @@ if __name__ == '__main__':
     if args.populate:
         aio.ensure_future(_populate_queue())
 
-    updater = FeedUpdater(loop)
-    aio.ensure_future(updater.run())
+    aio.ensure_future(run(loop))
 
     logging.getLogger(LOGGER).debug('Starting an event loop')
     loop.run_forever()
