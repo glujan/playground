@@ -18,6 +18,9 @@ REDIS_CONF = {
     'port': 6379,
     'poolsize': 100,
 }
+
+R_URLS = 'urls'
+R_FEED = 'feed'
 LOGGER = 'playground'
 
 
@@ -43,36 +46,44 @@ class FeedUpdater(object):
 
         return feed
 
-    async def _fetch(self, session):
+    async def execute(self, url: str, session: ClientSession):
+        response = None  # type: str
         logger = logging.getLogger(LOGGER)
-        while True:
-            url = (await self._redis.blpop(['urls', ])).value
-            async with session.get(url) as response:
-                response = await response.read()
-            try:
-                feed = await self._loop.run_in_executor(None, self.parse, response)
-                logger.info('Parsed feed: %s', url)
-            except FeedError:
-                logger.warn('Invalid feed: %s', url)
+        async with session.get(url) as response:  # FIXME Handle aiohttp.errors.ClientOSError
+            response = await response.read()
+
+        try:
+            feed = await self._loop.run_in_executor(None, self.parse, response)
+        except FeedError:
+            logger.warn('Invalid feed: %s', url)
+            # TODO Handle FeedError properly
+        else:
+            logger.info('Parsed feed: %s', url)
+            await self._redis.lpush(R_FEED, [feed.SerializePartialToString(), ])
 
     async def run(self):
         logger = logging.getLogger(LOGGER)
         self._redis = await RedisPool.create(**REDIS_CONF)
-        async with ClientSession() as session:
-            tasks_count = REDIS_CONF['poolsize']
-            logger.info('Starting to fetch URLs')
-            await aio.wait(
-                tuple(self._fetch(session) for i in range(tasks_count))
-            )
+        session = ClientSession()
+
+        logger.info('Starting up FeedUpdater')
+        try:
+            while True:
+                url = (await self._redis.blpop([R_URLS, ])).value
+                self._loop.create_task(self.execute(url, session))
+        finally:
             self._redis.close()
+            session.close()
 
 
 async def _populate_queue():
     url = "http://localhost:8080/{}"
     i = 0
-    conn = await RedisConn.create(host=REDIS_CONF['host'], port=REDIS_CONF['port'])
+    redis_conf = REDIS_CONF.copy()
+    redis_conf.pop('poolsize', '')
+    conn = await RedisConn.create(**redis_conf)
     while True:
-        await conn.lpush('urls', [url.format(i), ])
+        await conn.lpush(R_URLS, [url.format(i), ])
         await aio.sleep(random.random())
         i += 1
 
