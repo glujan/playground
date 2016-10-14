@@ -7,6 +7,7 @@ from signal import SIGTERM, SIGINT
 
 from aiohttp import ClientSession
 from asyncio_redis import Pool as RedisPool, Connection as RedisConn
+from asyncio_redis.encoders import BytesEncoder
 from feedparser import parse as parse_feed
 from google.protobuf.message import Message
 
@@ -17,10 +18,11 @@ REDIS_CONF = {
     'host': 'localhost',
     'port': 6379,
     'poolsize': 100,
+    'encoder': BytesEncoder()
 }
 
-R_URLS = 'urls'
-R_FEED = 'feed'
+R_URLS = b'urls'
+R_FEED = b'feed'
 LOGGER = 'playground'
 
 
@@ -65,11 +67,10 @@ class FeedUpdater(object):
         logger = logging.getLogger(LOGGER)
         self._redis = await RedisPool.create(**REDIS_CONF)
         session = ClientSession()
-
         logger.info('Starting up FeedUpdater')
         try:
             while True:
-                url = (await self._redis.blpop([R_URLS, ])).value
+                url = (await self._redis.blpop([R_URLS, ])).value.decode('utf8')
                 self._loop.create_task(self.execute(url, session))
         finally:
             self._redis.close()
@@ -79,11 +80,14 @@ class FeedUpdater(object):
 async def _populate_queue():
     url = "http://localhost:8080/{}"
     i = 0
-    redis_conf = REDIS_CONF.copy()
-    redis_conf.pop('poolsize', '')
+    redis_conf = {
+        'host': REDIS_CONF.get('host'),
+        'port': REDIS_CONF.get('port'),
+        'encoder': REDIS_CONF.get('encoder'),
+    }
     conn = await RedisConn.create(**redis_conf)
     while True:
-        await conn.lpush(R_URLS, [url.format(i), ])
+        await conn.lpush(R_URLS, [bytes(url.format(i), 'utf8'), ])
         await aio.sleep(random.random())
         i += 1
 
