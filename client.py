@@ -113,6 +113,10 @@ def _setup_logging(loglevel: int):
 
 def _setup_event_loop(debug=False):
     def ask_exit():
+        logger = logging.getLogger(LOGGER)
+        if logger.getEffectiveLevel() >= logging.WARN:
+            logger.warn('Killing %d tasks', len(aio.Task.all_tasks()))
+        logger.info('Stopping an event loop')
         loop.stop()
         logging.shutdown()
         sys.exit(0)
@@ -137,5 +141,5 @@ if __name__ == '__main__':
     updater = FeedUpdater(loop)
     aio.ensure_future(updater.run())
 
-    logging.getLogger(LOGGER).debug('Starting event loop...')
+    logging.getLogger(LOGGER).debug('Starting an event loop')
     loop.run_forever()
