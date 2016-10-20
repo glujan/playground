@@ -3,10 +3,12 @@ import asyncio as aio
 import logging
 import random
 import sys
+import typing
+from abc import abstractmethod
 from signal import SIGTERM, SIGINT
 
 from aiohttp import ClientSession
-from asyncio_redis import Pool as RedisPool, Connection as RedisConn
+from asyncio_redis import Pool as RedisPool
 from asyncio_redis.encoders import BytesEncoder
 from feedparser import parse as parse_feed
 from google.protobuf.message import Message
@@ -21,42 +23,100 @@ REDIS_CONF = {
     'encoder': BytesEncoder()
 }
 
-R_URLS = b'urls'
-R_FEED = b'feed'
-LOGGER = 'playground'
+R_SRC = b'urls'
+R_DST = b'feed'
+logger = logging.getLogger('playground')
 
 
-class FeedError(ValueError):
-    "Raise when cannot parse RSS/Atom feed"
+ConnConf = typing.Dict[str, typing.Any]
+Url = typing.NewType('Url', bytes)
 
 
-class FeedUpdater(object):
+class RedisConn:
+    def __init__(self, conf: ConnConf) -> None:
+        self._conf = conf
+        self._conn = None  # type: typing.Any
 
-    def __init__(self, loop: aio.AbstractEventLoop) -> None:
-        self._loop = loop
-        self._redis = None  # type: RedisPool
-
-    async def __aenter__(self):
-        if self._redis is None:
-            self._redis = await RedisPool.create(**REDIS_CONF)
+    async def __aenter__(self) -> 'RedisConn':
+        self._conn = await (RedisPool.create(**self._conf))
         return self
 
     async def __aexit__(self, exc_type, exc_value, traceback):
         if exc_type is not None:
-            self._redis.close()
+            self._conn.close()
         else:
-            await self._redis.close()
+            await self._conn.close()
 
-    def __aiter__(self):
+    async def push(self, name: bytes, element: bytes) -> None:
+        return await self._conn.lpush(name, [element, ])
+
+    async def pop(self, name: bytes) -> bytes:
+        return (await self._conn.blpop([name, ])).value
+
+
+class BaseUrls(typing.AsyncIterator[Url]):
+    def __init__(self, conn: RedisConn, pop_name: bytes) -> None:
+        self._conn = conn
+        self._pop = pop_name
+
+    def __aiter__(self) -> typing.AsyncIterator[Url]:
         return self
 
-    async def __anext__(self):
-        return (await self._redis.blpop([R_URLS, ])).value.decode('utf8')
+    @abstractmethod
+    async def __anext__(self) -> Url:
+        pass
 
-    def parse(self, xml: str) -> Message:
-        parsed = parse_feed(xml)
+
+class RedisUrls(BaseUrls):
+    async def __anext__(self) -> Url:
+        data = await self._conn.pop(self._pop)
+        return Url(data)
+
+
+class FakeUrls(BaseUrls):
+    def __init__(self, conn: RedisConn, pop_name: bytes) -> None:
+        super().__init__(conn, pop_name)
+        self._base_url = "http://localhost:8080/{}"
+        self._current = 0
+
+    async def __anext__(self) -> Url:
+        url = Url(bytes(self._base_url.format(self._current), 'utf8'))
+        self._current += 1
+        return url
+
+
+class ParseError(ValueError):
+    "Raise when cannot parse data from your source"
+
+
+class FeedUpdater:
+    def __init__(self, loop: aio.AbstractEventLoop, conn: RedisConn) -> None:
+        self._loop = loop
+        self._conn = conn
+
+    async def execute(self, url: str, session: ClientSession) -> Message:
+        try:
+            data = await self._get_data(session, url)
+            message = await self._loop.run_in_executor(None, self.parse, data)
+        except ParseError as e:
+            logger.warn('Invalid data source: %s', url)
+            raise
+        except Exception:
+            pass
+        else:
+            logger.debug('Parsed feed: %s', url)
+            await self._conn.push(R_DST, message.SerializePartialToString())
+            logger.info('Published feed: %s to %s', url, R_DST.decode('utf8'))
+            return message
+
+    async def _get_data(self, session, url: str) -> str:
+        async with session.get(url) as raw_data:
+            return await raw_data.read()
+
+    def parse(self, data: str) -> Message:
+        parsed = parse_feed(data)
         if parsed.bozo:
-            raise FeedError
+            raise ParseError
 
         feed = create_feed(parsed.feed)
         entries = list(map(create_entry, parsed.entries))
@@ -65,46 +125,28 @@ class FeedUpdater(object):
 
         return feed
 
-    async def execute(self, url: str, session: ClientSession):
-        response = None  # type: str
-        logger = logging.getLogger(LOGGER)
-        async with session.get(url) as response:  # FIXME Handle aiohttp.errors.ClientOSError
-            response = await response.read()
 
-        try:
-            feed = await self._loop.run_in_executor(None, self.parse, response)
-        except FeedError:
-            logger.warn('Invalid feed: %s', url)
-            # TODO Handle FeedError properly
-        else:
-            logger.info('Parsed feed: %s', url)
-            await self._redis.lpush(R_FEED, [feed.SerializePartialToString(), ])
-
-
-async def run(loop: aio.AbstractEventLoop) -> None:
-    logger = logging.getLogger(LOGGER)
-    logger.info('Starting up FeedUpdater')
-    async with ClientSession() as session, FeedUpdater(loop) as updater:
-        async for url in updater:
+async def main(loop: aio.AbstractEventLoop) -> None:
+    async with RedisConn(REDIS_CONF) as conn, ClientSession() as session:
+        updater = FeedUpdater(loop, conn)
+        async for url in RedisUrls(conn, R_SRC):
             logger.debug("Processing url '%s'", url)
-            loop.create_task(updater.execute(url, session))
-
-async def _populate_queue():
-    url = "http://localhost:8080/{}"
-    i = 0
-    redis_conf = {
-        'host': REDIS_CONF.get('host'),
-        'port': REDIS_CONF.get('port'),
-        'encoder': REDIS_CONF.get('encoder'),
-    }
-    conn = await RedisConn.create(**redis_conf)
-    while True:
-        await conn.lpush(R_URLS, [bytes(url.format(i), 'utf8'), ])
-        await aio.sleep(random.random())
-        i += 1
+            loop.create_task(updater.execute(url.decode('utf8'), session))
+            if len(aio.Task.all_tasks()) > 1000:
+                await aio.sleep(1)
 
 
-def _setup_argparse():
+async def _populate_queue() -> None:
+    local_conf = REDIS_CONF.copy()
+    local_conf['poolsize'] = 1
+
+    async with RedisConn(REDIS_CONF) as conn:
+        async for url in FakeUrls(conn, R_SRC):
+            await conn.push(R_SRC, url)
+            await aio.sleep(random.random())
+
+
+def _setup_argparse() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description='Fetch RSS/Atom feeds asynchronously.')
     parser.add_argument("-p", "--populate", action="store_true",
                         help='Populate Redis with fake URLs')
@@ -116,7 +158,7 @@ def _setup_argparse():
     return parser.parse_args()
 
 
-def _setup_logging(loglevel: int):
+def _setup_logging(loglevel: int) -> None:
     LEVELS = {
         0: logging.WARNING,
         1: logging.INFO,
@@ -127,9 +169,8 @@ def _setup_logging(loglevel: int):
     logging.basicConfig(level=LEVELS.get(loglevel, 3))
 
 
-def _setup_event_loop(debug=False):
-    def ask_exit():
-        logger = logging.getLogger(LOGGER)
+def _setup_event_loop(debug: bool=False) -> aio.AbstractEventLoop:
+    def ask_exit() -> None:
         if logger.getEffectiveLevel() >= logging.WARN:
             logger.warn('Killing %d tasks', len(aio.Task.all_tasks()))
         logger.info('Stopping an event loop')
@@ -154,7 +195,7 @@ if __name__ == '__main__':
     if args.populate:
         aio.ensure_future(_populate_queue())
 
-    aio.ensure_future(run(loop))
+    aio.ensure_future(main(loop))
 
-    logging.getLogger(LOGGER).debug('Starting an event loop')
+    logger.debug('Starting an event loop')
     loop.run_forever()
