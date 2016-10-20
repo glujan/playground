@@ -16,13 +16,6 @@ from google.protobuf.message import Message
 from utils import create_entry, create_feed
 
 
-REDIS_CONF = {
-    'host': 'localhost',
-    'port': 6379,
-    'poolsize': 100,
-    'encoder': BytesEncoder()
-}
-
 R_SRC = b'urls'
 R_DST = b'feed'
 logger = logging.getLogger('playground')
@@ -33,8 +26,13 @@ Url = typing.NewType('Url', bytes)
 
 
 class RedisConn:
-    def __init__(self, conf: ConnConf) -> None:
-        self._conf = conf
+    def __init__(self, **kwargs) -> None:
+        self._conf = {
+            'host': kwargs.pop('host', 'localhost'),
+            'port': kwargs.pop('port', 6379),
+            'poolsize': kwargs.pop('poolsize', 100),
+            'encoder': BytesEncoder(),
+        }
         self._conn = None  # type: typing.Any
 
     async def __aenter__(self) -> 'RedisConn':
@@ -127,7 +125,7 @@ class FeedUpdater:
 
 
 async def main(loop: aio.AbstractEventLoop) -> None:
-    async with RedisConn(REDIS_CONF) as conn, ClientSession() as session:
+    async with RedisConn() as conn, ClientSession() as session:
         updater = FeedUpdater(loop, conn)
         async for url in RedisUrls(conn, R_SRC):
             logger.debug("Processing url '%s'", url)
@@ -137,10 +135,7 @@ async def main(loop: aio.AbstractEventLoop) -> None:
 
 
 async def _populate_queue() -> None:
-    local_conf = REDIS_CONF.copy()
-    local_conf['poolsize'] = 1
-
-    async with RedisConn(REDIS_CONF) as conn:
+    async with RedisConn(poolsize=1) as conn:
         async for url in FakeUrls(conn, R_SRC):
             await conn.push(R_SRC, url)
             await aio.sleep(random.random())
